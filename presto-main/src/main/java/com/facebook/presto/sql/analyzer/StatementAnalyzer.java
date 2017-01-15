@@ -14,6 +14,7 @@
 package com.facebook.presto.sql.analyzer;
 
 import com.facebook.presto.Session;
+import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.metadata.FunctionKind;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.QualifiedObjectName;
@@ -59,6 +60,8 @@ import com.facebook.presto.sql.tree.Execute;
 import com.facebook.presto.sql.tree.Explain;
 import com.facebook.presto.sql.tree.ExplainType;
 import com.facebook.presto.sql.tree.Expression;
+import com.facebook.presto.sql.tree.ExpressionRewriter;
+import com.facebook.presto.sql.tree.ExpressionTreeRewriter;
 import com.facebook.presto.sql.tree.FieldReference;
 import com.facebook.presto.sql.tree.FrameBound;
 import com.facebook.presto.sql.tree.FunctionCall;
@@ -114,7 +117,6 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Multimap;
-import com.google.common.primitives.Ints;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -125,7 +127,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
+import static com.facebook.presto.SystemSessionProperties.LEGACY_ORDER_BY;
 import static com.facebook.presto.metadata.FunctionKind.AGGREGATE;
 import static com.facebook.presto.metadata.FunctionKind.WINDOW;
 import static com.facebook.presto.metadata.MetadataUtil.createQualifiedObjectName;
@@ -156,6 +160,7 @@ import static com.facebook.presto.sql.analyzer.SemanticErrorCode.ORDER_BY_MUST_B
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.TABLE_ALREADY_EXISTS;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.TYPE_MISMATCH;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.VIEW_ANALYSIS_ERROR;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.VIEW_IS_RECURSIVE;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.VIEW_IS_STALE;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.VIEW_PARSE_ERROR;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.WILDCARD_WITHOUT_FROM;
@@ -176,6 +181,7 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.Iterables.getLast;
 import static com.google.common.collect.Iterables.transform;
+import static java.lang.Math.toIntExact;
 import static java.util.Collections.emptyList;
 import static java.util.Objects.requireNonNull;
 
@@ -379,7 +385,7 @@ class StatementAnalyzer
 
         validateColumns(node, queryScope.getRelationType());
 
-        return createScope(node, scope, queryScope.getRelationType());
+        return createScope(node, scope, emptyList());
     }
 
     @Override
@@ -636,6 +642,17 @@ class StatementAnalyzer
 
         Optional<ViewDefinition> optionalView = metadata.getView(session, name);
         if (optionalView.isPresent()) {
+            Statement statement = analysis.getStatement();
+            if (statement instanceof CreateView) {
+                CreateView viewStatement = (CreateView) statement;
+                QualifiedObjectName viewNameFromStatement = createQualifiedObjectName(session, viewStatement, viewStatement.getName());
+                if (viewStatement.isReplace() && viewNameFromStatement.equals(name)) {
+                    throw new SemanticException(VIEW_IS_RECURSIVE, table, "Statement would create a recursive view");
+                }
+            }
+            if (analysis.hasTableInView(table)) {
+                throw new SemanticException(VIEW_IS_RECURSIVE, table, "View is recursive");
+            }
             ViewDefinition view = optionalView.get();
 
             Query query = parseView(view.getOriginalSql(), name, table);
@@ -643,7 +660,10 @@ class StatementAnalyzer
             analysis.registerNamedQuery(table, query);
 
             accessControl.checkCanSelectFromView(session.getRequiredTransactionId(), session.getIdentity(), name);
+
+            analysis.registerTableForView(table);
             RelationType descriptor = analyzeView(query, name, view.getCatalog(), view.getSchema(), view.getOwner(), table);
+            analysis.unregisterTableForView();
 
             if (isViewStale(view.getColumns(), descriptor.getVisibleFields())) {
                 throw new SemanticException(VIEW_IS_STALE, table, "View '%s' is stale; it must be re-created", name);
@@ -785,7 +805,12 @@ class StatementAnalyzer
         List<Expression> orderByExpressions = analyzeOrderBy(node, sourceScope, outputScope, outputExpressions);
         analyzeHaving(node, sourceScope);
 
-        analyzeAggregations(node, sourceScope, groupByExpressions, outputExpressions, orderByExpressions, analysis.getColumnReferences());
+        List<Expression> expressions = new ArrayList<>();
+        expressions.addAll(outputExpressions);
+        expressions.addAll(orderByExpressions);
+        node.getHaving().ifPresent(expressions::add);
+
+        analyzeAggregations(node, sourceScope, groupByExpressions, analysis.getColumnReferences(), expressions);
         analyzeWindowFunctions(node, outputExpressions, orderByExpressions);
 
         return outputScope;
@@ -934,7 +959,7 @@ class StatementAnalyzer
                 analysis.addCoercion(expression, BOOLEAN, false);
             }
 
-            Analyzer.verifyNoAggregatesOrWindowFunctions(metadata, expression, "JOIN");
+            Analyzer.verifyNoAggregatesOrWindowFunctions(metadata.getFunctionRegistry(), expression, "JOIN clause");
 
             // expressionInterpreter/optimizer only understands a subset of expression types
             // TODO: remove this when the new expression tree is implemented
@@ -1222,6 +1247,75 @@ class StatementAnalyzer
 
     private List<Expression> analyzeOrderBy(QuerySpecification node, Scope sourceScope, Scope outputScope, List<Expression> outputExpressions)
     {
+        if (SystemSessionProperties.isLegacyOrderByEnabled(session)) {
+            return legacyAnalyzeOrderBy(node, sourceScope, outputScope, outputExpressions);
+        }
+
+        List<SortItem> items = node.getOrderBy();
+
+        ImmutableList.Builder<Expression> orderByExpressionsBuilder = ImmutableList.builder();
+
+        if (!items.isEmpty()) {
+            for (SortItem item : items) {
+                Expression expression = item.getSortKey();
+
+                Expression orderByExpression;
+                if (expression instanceof LongLiteral) {
+                    // this is an ordinal in the output tuple
+
+                    long ordinal = ((LongLiteral) expression).getValue();
+                    if (ordinal < 1 || ordinal > outputExpressions.size()) {
+                        throw new SemanticException(INVALID_ORDINAL, expression, "ORDER BY position %s is not in select list", ordinal);
+                    }
+
+                    int field = toIntExact(ordinal - 1);
+                    Type type = outputScope.getRelationType().getFieldByIndex(field).getType();
+                    if (!type.isOrderable()) {
+                        throw new SemanticException(TYPE_MISMATCH, node, "The type of expression in position %s is not orderable (actual: %s), and therefore cannot be used in ORDER BY", ordinal, type);
+                    }
+
+                    orderByExpression = outputExpressions.get(field);
+                }
+                else {
+                    // Analyze the original expression using a synthetic scope (which delegates to the source scope for any missing name)
+                    // to catch any semantic errors (due to type mismatch, etc)
+                    Scope synthetic = Scope.builder()
+                            .withParent(sourceScope)
+                            .withRelationType(outputScope.getRelationType())
+                            .build();
+
+                    analyzeExpression(expression, synthetic);
+
+                    orderByExpression = ExpressionTreeRewriter.rewriteWith(new OrderByExpressionRewriter(extractNamedOutputExpressions(node)), expression);
+
+                    ExpressionAnalysis expressionAnalysis = analyzeExpression(orderByExpression, sourceScope);
+                    analysis.recordSubqueries(node, expressionAnalysis);
+                }
+
+                Type type = analysis.getType(orderByExpression);
+                if (!type.isOrderable()) {
+                    throw new SemanticException(TYPE_MISMATCH, node, "Type %s is not orderable, and therefore cannot be used in ORDER BY: %s", type, expression);
+                }
+
+                orderByExpressionsBuilder.add(orderByExpression);
+            }
+        }
+
+        List<Expression> orderByExpressions = orderByExpressionsBuilder.build();
+        analysis.setOrderByExpressions(node, orderByExpressions);
+
+        if (node.getSelect().isDistinct() && !outputExpressions.containsAll(orderByExpressions)) {
+            throw new SemanticException(ORDER_BY_MUST_BE_IN_SELECT, node.getSelect(), "For SELECT DISTINCT, ORDER BY expressions must appear in select list");
+        }
+        return orderByExpressions;
+    }
+
+    /**
+     * Preserve the old column resolution behavior for ORDER BY while we transition workloads to new semantics
+     * TODO: remove this
+     */
+    private List<Expression> legacyAnalyzeOrderBy(QuerySpecification node, Scope sourceScope, Scope outputScope, List<Expression> outputExpressions)
+    {
         List<SortItem> items = node.getOrderBy();
 
         ImmutableList.Builder<Expression> orderByExpressionsBuilder = ImmutableList.builder();
@@ -1265,7 +1359,7 @@ class StatementAnalyzer
                         throw new SemanticException(INVALID_ORDINAL, expression, "ORDER BY position %s is not in select list", ordinal);
                     }
 
-                    int field = Ints.checkedCast(ordinal - 1);
+                    int field = toIntExact(ordinal - 1);
                     Type type = outputScope.getRelationType().getFieldByIndex(field).getType();
                     if (!type.isOrderable()) {
                         throw new SemanticException(TYPE_MISMATCH, node, "The type of expression in position %s is not orderable (actual: %s), and therefore cannot be used in ORDER BY", ordinal, type);
@@ -1300,6 +1394,62 @@ class StatementAnalyzer
         return orderByExpressions;
     }
 
+    private static Multimap<QualifiedName, Expression> extractNamedOutputExpressions(QuerySpecification node)
+    {
+        // Compute aliased output terms so we can resolve order by expressions against them first
+        ImmutableMultimap.Builder<QualifiedName, Expression> assignments = ImmutableMultimap.builder();
+        for (SelectItem item : node.getSelect().getSelectItems()) {
+            if (item instanceof SingleColumn) {
+                SingleColumn column = (SingleColumn) item;
+                Optional<String> alias = column.getAlias();
+                if (alias.isPresent()) {
+                    assignments.put(QualifiedName.of(alias.get()), column.getExpression()); // TODO: need to know if alias was quoted
+                }
+                else if (column.getExpression() instanceof QualifiedNameReference) {
+                    assignments.put(((QualifiedNameReference) column.getExpression()).getName(), column.getExpression());
+                }
+            }
+        }
+
+        return assignments.build();
+    }
+
+    private static class OrderByExpressionRewriter
+            extends ExpressionRewriter<Void>
+    {
+        private final Multimap<QualifiedName, Expression> assignments;
+
+        public OrderByExpressionRewriter(Multimap<QualifiedName, Expression> assignments)
+        {
+            this.assignments = assignments;
+        }
+
+        @Override
+        public Expression rewriteQualifiedNameReference(QualifiedNameReference reference, Void context, ExpressionTreeRewriter<Void> treeRewriter)
+        {
+            if (reference.getName().getPrefix().isPresent()) {
+                return reference;
+            }
+
+            // if this is a simple name reference, try to resolve against output columns
+            QualifiedName name = reference.getName();
+            Set<Expression> expressions = assignments.get(name)
+                    .stream()
+                    .collect(Collectors.toSet());
+
+            if (expressions.size() > 1) {
+                throw new SemanticException(AMBIGUOUS_ATTRIBUTE, reference, "'%s' in ORDER BY is ambiguous", name.getSuffix());
+            }
+
+            if (expressions.size() == 1) {
+                return Iterables.getOnlyElement(expressions);
+            }
+
+            // otherwise, couldn't resolve name against output aliases, so fall through...
+            return reference;
+        }
+    }
+
     private List<List<Expression>> analyzeGroupBy(QuerySpecification node, Scope scope, List<Expression> outputExpressions)
     {
         List<Set<Expression>> computedGroupingSets = ImmutableList.of(); // empty list = no aggregations
@@ -1313,7 +1463,7 @@ class StatementAnalyzer
             computedGroupingSets = computeGroupingSetsCrossProduct(enumeratedGroupingSets, node.getGroupBy().get().isDistinct());
             checkState(!computedGroupingSets.isEmpty(), "computed grouping sets cannot be empty");
         }
-        else if (!extractAggregates(node).isEmpty()) {
+        else if (hasAggregates(node)) {
             // if there are aggregates, but no group by, create a grand total grouping set (global aggregation)
             computedGroupingSets = ImmutableList.of(ImmutableSet.of());
         }
@@ -1371,7 +1521,7 @@ class StatementAnalyzer
                     throw new SemanticException(INVALID_ORDINAL, groupingColumn, "GROUP BY position %s is not in select list", ordinal);
                 }
 
-                groupByExpression = outputExpressions.get(Ints.checkedCast(ordinal - 1));
+                groupByExpression = outputExpressions.get(toIntExact(ordinal - 1));
             }
             else {
                 ExpressionAnalysis expressionAnalysis = analyzeExpression(groupingColumn, scope);
@@ -1379,7 +1529,7 @@ class StatementAnalyzer
                 groupByExpression = groupingColumn;
             }
 
-            Analyzer.verifyNoAggregatesOrWindowFunctions(metadata, groupByExpression, "GROUP BY");
+            Analyzer.verifyNoAggregatesOrWindowFunctions(metadata.getFunctionRegistry(), groupByExpression, "GROUP BY clause");
             Type type = analysis.getType(groupByExpression);
             if (!type.isComparable()) {
                 throw new SemanticException(TYPE_MISMATCH, node, "%s is not comparable, and therefore cannot be used in GROUP BY", type);
@@ -1496,7 +1646,7 @@ class StatementAnalyzer
 
     public void analyzeWhere(Node node, Scope scope, Expression predicate)
     {
-        Analyzer.verifyNoAggregatesOrWindowFunctions(metadata, predicate, "WHERE");
+        Analyzer.verifyNoAggregatesOrWindowFunctions(metadata.getFunctionRegistry(), predicate, "WHERE clause");
 
         ExpressionAnalysis expressionAnalysis = analyzeExpression(predicate, scope);
         analysis.recordSubqueries(node, expressionAnalysis);
@@ -1526,11 +1676,14 @@ class StatementAnalyzer
             QuerySpecification node,
             Scope scope,
             List<List<Expression>> groupingSets,
-            List<Expression> outputExpressions,
-            List<Expression> orderByExpressions,
-            Set<Expression> columnReferences)
+            Set<Expression> columnReferences,
+            List<Expression> expressions)
     {
-        extractAggregates(node);
+        AggregateExtractor extractor = new AggregateExtractor(metadata.getFunctionRegistry());
+        for (Expression expression : expressions) {
+            extractor.process(expression);
+        }
+        analysis.setAggregates(node, extractor.getAggregates());
 
         // is this an aggregation query?
         if (!groupingSets.isEmpty()) {
@@ -1544,37 +1697,28 @@ class StatementAnalyzer
                     .distinct()
                     .collect(toImmutableList());
 
-            for (Expression expression : Iterables.concat(outputExpressions, orderByExpressions)) {
+            for (Expression expression : expressions) {
                 verifyAggregations(distinctGroupingColumns, scope, expression, columnReferences);
-            }
-
-            if (node.getHaving().isPresent()) {
-                verifyAggregations(distinctGroupingColumns, scope, node.getHaving().get(), columnReferences);
             }
         }
     }
 
-    private List<FunctionCall> extractAggregates(QuerySpecification node)
+    private boolean hasAggregates(QuerySpecification node)
     {
-        AggregateExtractor extractor = new AggregateExtractor(metadata);
-        for (SelectItem item : node.getSelect().getSelectItems()) {
-            if (item instanceof SingleColumn) {
-                extractor.process(((SingleColumn) item).getExpression(), null);
-            }
-        }
+        AggregateExtractor extractor = new AggregateExtractor(metadata.getFunctionRegistry());
 
-        for (SortItem item : node.getOrderBy()) {
-            extractor.process(item.getSortKey(), null);
-        }
+        node.getSelect()
+                .getSelectItems().stream()
+                .filter(SingleColumn.class::isInstance)
+                .forEach(extractor::process);
 
-        if (node.getHaving().isPresent()) {
-            extractor.process(node.getHaving().get(), null);
-        }
+        node.getOrderBy().stream()
+                .forEach(extractor::process);
 
-        List<FunctionCall> aggregates = extractor.getAggregates();
-        analysis.setAggregates(node, aggregates);
+        node.getHaving()
+                .ifPresent(extractor::process);
 
-        return aggregates;
+        return !extractor.getAggregates().isEmpty();
     }
 
     private void verifyAggregations(
@@ -1583,7 +1727,7 @@ class StatementAnalyzer
             Expression expression,
             Set<Expression> columnReferences)
     {
-        AggregationAnalyzer analyzer = new AggregationAnalyzer(groupByExpressions, metadata, scope, columnReferences, analysis.getParameters());
+        AggregationAnalyzer analyzer = new AggregationAnalyzer(groupByExpressions, metadata, scope, columnReferences, analysis.getParameters(), analysis.isDescribe());
         analyzer.analyze(expression);
     }
 
@@ -1613,7 +1757,9 @@ class StatementAnalyzer
                     .setLocale(session.getLocale())
                     .setRemoteUserAddress(session.getRemoteUserAddress().orElse(null))
                     .setUserAgent(session.getUserAgent().orElse(null))
+                    .setClientInfo(session.getClientInfo().orElse(null))
                     .setStartTime(session.getStartTime())
+                    .setSystemProperty(LEGACY_ORDER_BY, session.getSystemProperty(LEGACY_ORDER_BY, Boolean.class).toString())
                     .build();
 
             StatementAnalyzer analyzer = new StatementAnalyzer(analysis, metadata, sqlParser, viewAccessControl, viewSession);
@@ -1735,7 +1881,7 @@ class StatementAnalyzer
                     throw new SemanticException(INVALID_ORDINAL, expression, "ORDER BY position %s is not in select list", ordinal);
                 }
 
-                expression = new FieldReference(Ints.checkedCast(ordinal - 1));
+                expression = new FieldReference(toIntExact(ordinal - 1));
             }
 
             ExpressionAnalysis expressionAnalysis = ExpressionAnalyzer.analyzeExpression(session,

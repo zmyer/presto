@@ -74,7 +74,7 @@ import static org.testng.Assert.assertTrue;
 @Test(singleThreaded = true)
 public class TestExchangeOperator
 {
-    private static final List<Type> TYPES = ImmutableList.<Type>of(VARCHAR);
+    private static final List<Type> TYPES = ImmutableList.of(VARCHAR);
     private static final Page PAGE = createSequencePage(TYPES, 10, 100);
     private static final BlockEncodingManager blockEncodingSerde = new BlockEncodingManager(new TypeRegistry());
 
@@ -110,6 +110,7 @@ public class TestExchangeOperator
                 new DataSize(32, MEGABYTE),
                 new DataSize(10, MEGABYTE),
                 3,
+                new Duration(1, TimeUnit.MINUTES),
                 new Duration(1, TimeUnit.MINUTES),
                 httpClient,
                 executor,
@@ -287,7 +288,7 @@ public class TestExchangeOperator
                 break;
             }
 
-            if (operator.getOperatorContext().getOperatorStats().getSystemMemoryReservation().toBytes() > 0) {
+            if (operator.getOperatorContext().getDriverContext().getPipelineContext().getPipelineStats().getSystemMemoryReservation().toBytes() > 0) {
                 greaterThanZero = true;
                 break;
             }
